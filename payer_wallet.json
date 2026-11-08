@@ -1,0 +1,14 @@
+{
+  "vpa": "rishi@okaxis",
+  "priv_bytes": "04df7d5fb4c3b0bfa42bf9cb30797b0fac01d3c2b623d2f85d4195f390b68c93",
+  "pub_b64": "et8sX4evNw8F8aNXKACZvbTDpZFgI03e6jf1woAVzwk=",
+  "balance": 200.0,
+  "nonce": 2,
+  "prev_hash": "cc4b011fe85e49865aefb9a6905ed07c0b0fb79c2e271c3050173220f59fb73f",
+  "certificate": {
+    "vpa": "rishi@okaxis",
+    "payer_pub_key": "et8sX4evNw8F8aNXKACZvbTDpZFgI03e6jf1woAVzwk=",
+    "locked_amount": 500.0
+  },
+  "bank_sig": "PLTmqSigptBhaSR4WKDbiRGigza6IPJUmBGbuLuvh87NbzDZDWspIgww6E8mSkbFXE+zk3w3eAgQtU5rMNThCg=="
+}
