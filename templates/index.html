@@ -1,331 +1,324 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>AirUPI Protocol</title>
-  
-  <style>
-    /* Embedded core styling so Tailwind CDN failure never breaks UI offline */
-    :root { --obsidian: #090d16; --card: #111726; --border: #23304a; --cobalt: #2563eb; }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
-    body { background-color: var(--obsidian); color: #f8fafc; min-height: 100vh; display: flex; flex-direction: column; justify-content: space-between; }
-    header { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
-    .badge-icon { background: var(--cobalt); color: white; width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 11px; }
-    .btn-toggle { background: var(--obsidian); border: 1px solid var(--border); border-radius: 8px; padding: 2px; display: flex; }
-    .btn-toggle button { padding: 6px 12px; font-size: 11px; font-weight: bold; border-radius: 6px; border: none; cursor: pointer; color: #94a3b8; background: transparent; }
-    .btn-toggle button.active { background: var(--cobalt); color: white; }
-    main { max-width: 800px; width: 100%; margin: 0 auto; padding: 16px; flex-grow: 1; display: flex; align-items: center; justify-content: center; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); width: 100%; margin-bottom: 16px; }
-    .btn-primary { width: 100%; padding: 12px; border-radius: 8px; background: var(--cobalt); color: white; border: none; font-weight: bold; font-size: 13px; cursor: pointer; }
-    .btn-secondary { width: 100%; padding: 12px; border-radius: 8px; background: var(--obsidian); border: 1px solid var(--border); color: #cbd5e1; font-weight: bold; font-size: 13px; cursor: pointer; }
-    .grid-2 { display: grid; grid-template-columns: 1fr; gap: 16px; width: 100%; }
-    @media (min-width: 640px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
-    .hidden { display: none !important; }
-    .mono { font-family: monospace; }
-    #reader video { border-radius: 8px; width: 100% !important; height: auto !important; object-fit: cover; }
-    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
-    .modal-box { background: var(--card); border: 1px solid rgba(16,185,129,0.4); border-radius: 16px; padding: 24px; max-width: 320px; width: 100%; text-align: center; }
-  </style>
+<script>
+  // --- Audio Chime Generator (Native Web Audio API) ---
+  function playSuccessChime() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+      osc.frequency.setValueAtTime(880.00, ctx.currentTime + 0.1); // A5
+      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.4);
+    } catch (e) {}
+  }
 
-  <!-- Local Offline Assets -->
-  <script src="/static/js/qrcode.min.js"></script>
-  <script src="/static/js/jsQR.min.js"></script>
-  <script src="/static/js/nacl-fast.min.js"></script>
-</head>
+  // --- State Initialization ---
+  let balance = parseFloat(localStorage.getItem('airupi_bal') || '10000');
+  let currentNonce = parseInt(localStorage.getItem('airupi_nonce') || '0');
+  let localLedger = JSON.parse(localStorage.getItem('airupi_ledger') || '[]');
+  let knownNonces = new Set(localLedger.map(r => String(r.nonce)));
 
-<body>
+  // Render initial escrow balance
+  const balDisplay = document.getElementById('escrowBalDisplay');
+  if (balDisplay) balDisplay.innerText = balance.toLocaleString('en-IN');
 
-  <header>
-    <div style="display:flex; align-items:center; gap:8px;">
-      <div class="badge-icon">AU</div>
-      <span style="font-weight:bold; font-size:14px;">AirUPI <span style="font-size:10px; color:#60a5fa;" class="mono">OFFLINE-PWA</span></span>
-    </div>
-    <div class="btn-toggle">
-      <button id="btnPayer" onclick="switchRole('payer')" class="active">Sender</button>
-      <button id="btnMerchant" onclick="switchRole('merchant')">Receiver</button>
-    </div>
-  </header>
+  // Generate or retrieve persistent deterministic Ed25519 keypair
+  let keyPair;
+  const storedSeed = localStorage.getItem('airupi_seed');
+  if (storedSeed) {
+    keyPair = nacl.sign.keyPair.fromSeed(Uint8Array.from(atob(storedSeed), c => c.charCodeAt(0)));
+  } else {
+    keyPair = nacl.sign.keyPair();
+    localStorage.setItem('airupi_seed', btoa(String.fromCharCode(...keyPair.secretKey.slice(0, 32))));
+  }
+  const payerPubB64 = btoa(String.fromCharCode(...keyPair.publicKey));
 
-  <main>
-    <!-- SENDER VIEW -->
-    <div id="payerView" class="grid-2">
-      <div>
-        <div class="card">
-          <span style="font-size:11px; color:#94a3b8;" class="mono">ESCROW BALANCE</span>
-          <div style="font-size:32px; font-weight:800; margin-top:4px;">₹<span id="escrowBalDisplay" class="mono">10,000.00</span></div>
-          <div style="font-size:11px; color:#64748b; margin-top:8px;" class="mono">Payer: rishi@airupi</div>
-        </div>
-        <div class="card">
-          <label style="font-size:11px; color:#94a3b8; display:block; margin-bottom:8px;" class="mono">AMOUNT (INR)</label>
-          <input type="number" id="txAmount" value="150" style="width:100%; background:var(--obsidian); border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:18px; color:white; font-weight:bold; margin-bottom:12px; outline:none;" class="mono">
-          <button id="btnSign" onclick="generateVoucher()" class="btn-primary">GENERATE QR VOUCHER</button>
-        </div>
-      </div>
+  // --- Role Switcher ---
+  function switchRole(role) {
+    if (role === 'payer') {
+      document.getElementById('payerView').classList.remove('hidden');
+      document.getElementById('merchantView').classList.add('hidden');
+      document.getElementById('btnPayer').classList.add('active');
+      document.getElementById('btnMerchant').classList.remove('active');
+      stopScanner();
+    } else {
+      document.getElementById('payerView').classList.add('hidden');
+      document.getElementById('merchantView').classList.remove('hidden');
+      document.getElementById('btnMerchant').classList.add('active');
+      document.getElementById('btnPayer').classList.remove('active');
+      updateLedgerUI();
+    }
+  }
 
-      <div class="card" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center;">
-        <span style="font-size:11px; color:#94a3b8; margin-bottom:12px;" class="mono">SCAN VOUCHER (OPTICAL)</span>
-        <div style="background:white; padding:12px; border-radius:12px; display:inline-block;">
-          <div id="qrcode"></div>
-        </div>
-        <p style="font-size:11px; color:#64748b; margin-top:12px;" class="mono">Zero RF / Photons only</p>
-      </div>
-    </div>
-
-    <!-- RECEIVER VIEW -->
-    <div id="merchantView" class="hidden" style="max-width:380px; width:100%;">
-      <div class="card">
-        <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-          <span style="font-size:11px; color:#cbd5e1;" class="mono">SCANNER CAMERA</span>
-          <span id="camStatus" style="font-size:10px; color:#64748b;" class="mono">STANDBY</span>
-        </div>
-        <div style="position:relative; border-radius:8px; overflow:hidden; background:var(--obsidian); border:1px solid var(--border); min-height:240px; display:flex; align-items:center; justify-content:center;">
-          <video id="webcamVideo" playsinline style="width:100%; height:auto; object-fit:cover; border-radius:8px;"></video>
-          <canvas id="qrCanvas" class="hidden"></canvas>
-          <div style="position:absolute; inset:24px; border:2px solid rgba(37,99,235,0.4); border-radius:8px; pointer-events:none;"></div>
-        </div>
-        <div style="margin-top:12px;">
-          <button id="btnToggleCam" onclick="toggleScanner()" class="btn-primary">OPEN CAMERA</button>
-        </div>
-      </div>
-
-      <div id="verdictBanner" class="hidden" style="padding:12px; border-radius:8px; text-align:center; font-size:11px; font-weight:bold; margin-bottom:12px; font-family:monospace;"></div>
-
-      <div class="card">
-        <span style="font-size:11px; color:#94a3b8; display:block; margin-bottom:8px;" class="mono">OFFLINE RECEIPT LEDGER</span>
-        <div id="receiptsList" style="max-height:140px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
-          <p style="font-size:11px; color:#64748b; text-align:center; padding:8px;" class="mono">No transactions yet</p>
-        </div>
-      </div>
-    </div>
-  </main>
-
-  <!-- SUCCESS POPUP -->
-  <div id="successModal" class="modal hidden">
-    <div class="modal-box">
-      <div style="width:48px; height:48px; border-radius:50%; background:rgba(16,185,129,0.1); border:2px solid #10b981; display:flex; align-items:center; justify-content:center; margin:0 auto 12px auto; color:#34d399; font-size:24px; font-weight:bold;">✓</div>
-      <span style="font-size:11px; color:#34d399; font-weight:bold; letter-spacing:1px;" class="mono">PAYMENT VERIFIED</span>
-      <div style="font-size:32px; font-weight:800; color:white; margin:4px 0 12px 0;" class="mono">₹<span id="modalAmount">0</span></div>
-      
-      <div style="background:var(--obsidian); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:11px; text-align:left; color:#cbd5e1; display:flex; flex-direction:column; gap:6px;" class="mono">
-        <div style="display:flex; justify-content:space-between;"><span style="color:#64748b;">From:</span><span id="modalPayer">--</span></div>
-        <div style="display:flex; justify-content:space-between;"><span style="color:#64748b;">Nonce:</span><span id="modalNonce" style="color:#60a5fa; font-weight:bold;">--</span></div>
-        <div style="display:flex; justify-content:space-between;"><span style="color:#64748b;">Ed25519:</span><span style="color:#34d399; font-weight:bold;">PASSED ✓</span></div>
-        <div style="display:flex; justify-content:space-between;"><span style="color:#64748b;">Time:</span><span id="modalTime" style="color:#94a3b8;">--</span></div>
-      </div>
-
-      <button onclick="dismissSuccessAndResume()" class="btn-primary" style="margin-top:16px;">SCAN NEXT PAYMENT</button>
-    </div>
-  </div>
-
-  <script>
-    // Offline Service Worker for total caching
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // --- Payer: Voucher Minting Engine ---
+  function generateVoucher() {
+    const amtInput = document.getElementById('txAmount');
+    const amount = parseInt(amtInput.value, 10);
+    
+    if (isNaN(amount) || amount <= 0) {
+      alert("Enter a valid amount");
+      return;
+    }
+    if (amount > balance) {
+      alert("Insufficient escrow balance");
+      return;
     }
 
-    let videoStream = null;
-    let scanInterval = null;
-    let isProcessing = false;
-    let localLedger = JSON.parse(localStorage.getItem('airupi_receipts') || '[]');
-    let knownNonces = new Set(localLedger.map(r => r.nonce));
+    // Monotonic nonce increment per newly minted voucher
+    currentNonce += 1;
+    balance -= amount;
+    localStorage.setItem('airupi_bal', balance);
+    localStorage.setItem('airupi_nonce', currentNonce);
+    if (balDisplay) balDisplay.innerText = balance.toLocaleString('en-IN');
 
-    function b64ToUint8Array(b64) {
-      const bin = atob(b64);
-      const arr = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-      return arr;
-    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    const canonical = `rishi@airupi|merchant@airupi|${amount}|${currentNonce}|${timestamp}`;
+    const msgBytes = new TextEncoder().encode(canonical);
+    const sig = nacl.sign.detached(msgBytes, keyPair.secretKey);
 
-    function switchRole(role) {
-      if (role === 'payer') {
-        document.getElementById('payerView').classList.remove('hidden');
-        document.getElementById('merchantView').classList.add('hidden');
-        document.getElementById('btnPayer').classList.add('active');
-        document.getElementById('btnMerchant').classList.remove('active');
-        stopScanner();
-      } else {
-        document.getElementById('payerView').classList.add('hidden');
-        document.getElementById('merchantView').classList.remove('hidden');
-        document.getElementById('btnMerchant').classList.add('active');
-        document.getElementById('btnPayer').classList.remove('active');
-        updateLedgerUI();
-      }
-    }
+    const voucher = {
+      v: "1",
+      payer: "rishi@airupi",
+      payee: "merchant@airupi",
+      amt: amount,
+      n: currentNonce,
+      t: timestamp,
+      pub: payerPubB64,
+      sig: btoa(String.fromCharCode(...sig))
+    };
 
-    async function generateVoucher() {
-      const amount = parseFloat(document.getElementById('txAmount').value);
-      const btn = document.getElementById('btnSign');
-      btn.innerText = "SIGNING...";
-      try {
-        const res = await fetch('/api/create-voucher', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ amount: amount, payee_id: 'merchant@airupi' })
-        });
-        const data = await res.json();
-        if (data.error) return alert(data.error);
+    const qrContainer = document.getElementById("qrcode");
+    qrContainer.innerHTML = "";
+    new QRCode(qrContainer, {
+      text: JSON.stringify(voucher),
+      width: 220,
+      height: 220,
+      correctLevel: QRCode.CorrectLevel.M
+    });
+  }
 
-        document.getElementById('escrowBalDisplay').innerText = data.remaining_balance.toFixed(2);
-        const qrContainer = document.getElementById("qrcode");
-        qrContainer.innerHTML = "";
-        new QRCode(qrContainer, {
-          text: JSON.stringify(data.voucher),
-          width: 220,
-          height: 220,
-          correctLevel: QRCode.CorrectLevel.M
-        });
-      } catch (e) {
-        alert("Cannot reach server.py! Make sure py server.py is running.");
-      } finally {
-        btn.innerText = "GENERATE QR VOUCHER";
-      }
-    }
+  // --- Merchant: Scanner & State Machine ---
+  let videoStream = null;
+  let scanInterval = null;
+  let isScanningLocked = false; // Lock flag to prevent frame-burst double firing
+  let cooldownTimer = null;
 
-    function toggleScanner() {
-      if (videoStream) stopScanner();
-      else startScanner();
-    }
-
-    async function startScanner() {
-      if (videoStream) return;
-      isProcessing = false;
-      const status = document.getElementById('camStatus');
-      const btn = document.getElementById('btnToggleCam');
-      status.innerText = "STARTING...";
-      status.style.color = "#facc15";
-
-      try {
-        videoStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } }
-        });
-        const video = document.getElementById('webcamVideo');
-        video.srcObject = videoStream;
-        await video.play();
-
-        status.innerText = "SCANNING ACTIVE";
-        status.style.color = "#34d399";
-        btn.innerText = "STOP CAMERA";
-        btn.className = "btn-secondary";
-
-        scanInterval = setInterval(scanFrame, 150);
-      } catch (err) {
-        alert("Camera error: " + err.message);
-        status.innerText = "ERROR";
-        status.style.color = "#f43f5e";
-      }
-    }
-
-    function stopScanner() {
-      if (scanInterval) { clearInterval(scanInterval); scanInterval = null; }
-      if (videoStream) {
-        videoStream.getTracks().forEach(t => t.stop());
-        videoStream = null;
-      }
-      const video = document.getElementById('webcamVideo');
-      if (video) video.srcObject = null;
-
-      document.getElementById('camStatus').innerText = "STANDBY";
-      document.getElementById('camStatus').style.color = "#64748b";
-      const btn = document.getElementById('btnToggleCam');
-      if (btn) {
-        btn.innerText = "OPEN CAMERA";
-        btn.className = "btn-primary";
-      }
-    }
-
-    function scanFrame() {
-      if (isProcessing) return;
-      const video = document.getElementById('webcamVideo');
-      if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
-
-      const canvas = document.getElementById('qrCanvas');
-      const ctx = canvas.getContext('2d');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "dontInvert" });
-
-      if (code && code.data) {
-        onQrScanned(code.data);
-      }
-    }
-
-    function onQrScanned(text) {
-      if (isProcessing) return;
-
-      try {
-        const v = JSON.parse(text);
-        if (!v.amt || !v.n || !v.sig) return;
-
-        const banner = document.getElementById('verdictBanner');
-
-        if (knownNonces.has(v.n)) {
-          banner.classList.remove('hidden');
-          banner.style.background = "rgba(244,63,94,0.15)";
-          banner.style.border = "1px solid #f43f5e";
-          banner.style.color = "#f43f5e";
-          banner.innerHTML = "⚠ DOUBLE-SPEND DETECTED!";
-          return;
-        }
-
-        const canonical = `${v.payer}|${v.payee}|${v.amt}|${v.n}|${v.t}`;
-        const msgBytes = new TextEncoder().encode(canonical);
-        const sigBytes = b64ToUint8Array(v.sig);
-        const pubBytes = b64ToUint8Array(v.pub);
-
-        const verified = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
-
-        if (!verified) {
-          banner.classList.remove('hidden');
-          banner.style.background = "rgba(244,63,94,0.15)";
-          banner.style.border = "1px solid #f43f5e";
-          banner.style.color = "#f43f5e";
-          banner.innerHTML = "⚠ INVALID SIGNATURE!";
-          return;
-        }
-
-        isProcessing = true;
-        stopScanner();
-        banner.classList.add('hidden');
-
-        const timeStr = new Date().toLocaleTimeString();
-        knownNonces.add(v.n);
-        localLedger.unshift({ amount: v.amt, payer: v.payer, nonce: v.n, time: timeStr });
-        localStorage.setItem('airupi_receipts', JSON.stringify(localLedger));
-        updateLedgerUI();
-
-        document.getElementById('modalAmount').innerText = v.amt;
-        document.getElementById('modalPayer').innerText = v.payer;
-        document.getElementById('modalNonce').innerText = '#' + v.n;
-        document.getElementById('modalTime').innerText = timeStr;
-        document.getElementById('successModal').classList.remove('hidden');
-
-        if (navigator.vibrate) navigator.vibrate(200);
-
-      } catch (err) {}
-    }
-
-    function dismissSuccessAndResume() {
-      document.getElementById('successModal').classList.add('hidden');
-      isProcessing = false;
+  function toggleScanner() {
+    if (videoStream) {
+      stopScanner();
+    } else {
       startScanner();
     }
+  }
 
-    function updateLedgerUI() {
-      const list = document.getElementById('receiptsList');
-      if (localLedger.length === 0) return;
-      list.innerHTML = localLedger.map(r => `
-        <div style="display:flex; justify-content:space-between; padding:8px 10px; background:var(--obsidian); border:1px solid var(--border); border-radius:6px; font-size:11px;" class="mono">
-          <div><b style="color:white;">₹${r.amount}</b> <span style="color:#64748b;">#${r.nonce}</span></div>
-          <span style="color:#60a5fa;">${r.time}</span>
-        </div>
-      `).join('');
+  async function startScanner() {
+    if (videoStream) return;
+    isScanningLocked = false;
+    const status = document.getElementById('camStatus');
+    const btn = document.getElementById('btnToggleCam');
+    status.innerText = "STARTING...";
+    status.style.color = "#facc15";
+
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } }
+      });
+      const video = document.getElementById('webcamVideo');
+      video.srcObject = videoStream;
+      await video.play();
+
+      status.innerText = "SCANNING ACTIVE";
+      status.style.color = "#34d399";
+      btn.innerText = "STOP SCANNER";
+      btn.className = "btn-sub";
+
+      // Scan every 120ms
+      scanInterval = setInterval(scanFrame, 120);
+    } catch (err) {
+      alert("Camera access error: " + err.message);
+      status.innerText = "ERROR";
+      status.style.color = "#f43f5e";
     }
+  }
 
-    updateLedgerUI();
-  </script>
-</body>
-</html>
+  function stopScanner() {
+    if (scanInterval) { 
+      clearInterval(scanInterval); 
+      scanInterval = null; 
+    }
+    if (videoStream) {
+      videoStream.getTracks().forEach(t => t.stop());
+      videoStream = null;
+    }
+    const video = document.getElementById('webcamVideo');
+    if (video) video.srcObject = null;
+
+    const status = document.getElementById('camStatus');
+    if (status) {
+      status.innerText = "STANDBY";
+      status.style.color = "#64748b";
+    }
+    const btn = document.getElementById('btnToggleCam');
+    if (btn) {
+      btn.innerText = "START SCANNER";
+      btn.className = "btn-main";
+    }
+  }
+
+  function scanFrame() {
+    // If optical gate is locked (cooldown / displaying green modal), skip frame
+    if (isScanningLocked) return;
+
+    const video = document.getElementById('webcamVideo');
+    if (!video || video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+    const canvas = document.getElementById('qrCanvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "dontInvert" });
+
+    if (code && code.data) {
+      onQrScanned(code.data);
+    }
+  }
+
+  function onQrScanned(text) {
+    if (isScanningLocked) return;
+
+    try {
+      const v = JSON.parse(text);
+      if (!v.amt || !v.n || !v.sig) return;
+
+      const banner = document.getElementById('verdictBanner');
+      const nonceKey = String(v.n);
+
+      // --- 1. DOUBLE-SPEND DETECTION ---
+      if (knownNonces.has(nonceKey)) {
+        // Engage short 2.5s cooldown so the red alert does not flicker endlessly
+        isScanningLocked = true;
+        
+        banner.classList.remove('hidden');
+        banner.style.background = "rgba(244,63,94,0.18)";
+        banner.style.border = "1px solid #f43f5e";
+        banner.style.color = "#f43f5e";
+        banner.innerHTML = `⚠ DOUBLE-SPEND DETECTED! (Nonce #${v.n} already settled)`;
+
+        if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+
+        // Clear red alert and re-enable scanning after 2.5 seconds
+        clearTimeout(cooldownTimer);
+        cooldownTimer = setTimeout(() => {
+          banner.classList.add('hidden');
+          isScanningLocked = false;
+        }, 2500);
+        return;
+      }
+
+      // --- 2. CRYPTOGRAPHIC VERIFICATION (Ed25519) ---
+      const canonical = `${v.payer}|${v.payee}|${v.amt}|${v.n}|${v.t}`;
+      const msgBytes = new TextEncoder().encode(canonical);
+      const sigBytes = Uint8Array.from(atob(v.sig), c => c.charCodeAt(0));
+      const pubBytes = Uint8Array.from(atob(v.pub), c => c.charCodeAt(0));
+
+      const isValid = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
+
+      if (!isValid) {
+        isScanningLocked = true;
+        banner.classList.remove('hidden');
+        banner.style.background = "rgba(244,63,94,0.18)";
+        banner.style.border = "1px solid #f43f5e";
+        banner.style.color = "#f43f5e";
+        banner.innerHTML = "⚠ INVALID SIGNATURE!";
+        
+        setTimeout(() => {
+          banner.classList.add('hidden');
+          isScanningLocked = false;
+        }, 2000);
+        return;
+      }
+
+      // --- 3. VALID PAYMENT: LOCK ENGINE & SHOW GREEN RESULT ---
+      isScanningLocked = true; // Lock immediately to freeze further optical ingestions
+      banner.classList.add('hidden');
+      playSuccessChime();
+      if (navigator.vibrate) navigator.vibrate(200);
+
+      // Commit to local merchant ledger & persistent storage
+      const timeStr = new Date().toLocaleTimeString();
+      knownNonces.add(nonceKey);
+      localLedger.unshift({ amount: v.amt, payer: v.payer, nonce: v.n, time: timeStr });
+      localStorage.setItem('airupi_ledger', JSON.stringify(localLedger));
+      updateLedgerUI();
+
+      // Populate and reveal green verified modal
+      document.getElementById('modalAmount').innerText = v.amt;
+      document.getElementById('modalPayer').innerText = v.payer;
+      document.getElementById('modalNonce').innerText = '#' + v.n;
+      document.getElementById('modalTime').innerText = timeStr;
+      
+      const modal = document.getElementById('successModal');
+      modal.classList.remove('hidden');
+
+      // Enforce the green screen to stay visible for at least 3 seconds
+      const nextBtn = modal.querySelector('button');
+      if (nextBtn) {
+        nextBtn.disabled = true;
+        nextBtn.style.opacity = "0.5";
+        nextBtn.innerText = "VERIFYING (3s)...";
+
+        let countdown = 3;
+        const countInterval = setInterval(() => {
+          countdown -= 1;
+          if (countdown > 0) {
+            nextBtn.innerText = `READY IN (${countdown}s)...`;
+          } else {
+            clearInterval(countInterval);
+            nextBtn.disabled = false;
+            nextBtn.style.opacity = "1";
+            nextBtn.innerText = "SCAN NEXT";
+          }
+        }, 1000);
+      }
+
+    } catch (err) {
+      // Ignore invalid JSON / non-AirUPI barcodes
+    }
+  }
+
+  // --- Modal Dismissal & Resuming Scanner ---
+  function dismissSuccessAndResume() {
+    document.getElementById('successModal').classList.add('hidden');
+    // Cooldown pause of 1.5s after clicking 'SCAN NEXT' before camera accepts frames again
+    setTimeout(() => {
+      isScanningLocked = false;
+    }, 1500);
+  }
+
+  // --- Ledger UI Updater ---
+  function updateLedgerUI() {
+    const list = document.getElementById('receiptsList');
+    if (!list) return;
+    if (localLedger.length === 0) {
+      list.innerHTML = `<p style="font-size:11px; color:#64748b; text-align:center; padding:8px;" class="mono">No records present</p>`;
+      return;
+    }
+    list.innerHTML = localLedger.map(r => `
+      <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:var(--bg); border:1px solid var(--border); border-radius:6px; font-size:11px;" class="mono">
+        <div><b style="color:white;">₹${r.amount}</b> <span style="color:#64748b;">#${r.nonce}</span></div>
+        <span style="color:#60a5fa;">${r.time}</span>
+      </div>
+    `).join('');
+  }
+
+  // Ensure initial render
+  updateLedgerUI();
+</script>
