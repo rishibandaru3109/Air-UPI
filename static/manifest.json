@@ -1,0 +1,21 @@
+{
+  "name": "AirUPI - Zero-RF Optical Payments",
+  "short_name": "AirUPI",
+  "description": "Offline UPI payments using Ed25519-signed optical QR vouchers",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090d16",
+  "theme_color": "#38bdf8",
+  "icons": [
+    {
+      "src": "/static/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

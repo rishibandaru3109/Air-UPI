@@ -3,6 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#38bdf8" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png" />
   <title>AirUPI | Zero-RF Optical Payments</title>
   
   <!-- Cryptographic, Optical & QR Libraries -->
@@ -57,6 +63,7 @@
 
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     .hidden { display: none !important; }
+    #merchantView { display: flex; flex-direction: column; gap: 14px; }
 
     .app-card {
       width: 100%;
@@ -296,7 +303,7 @@
     </div>
 
     <!-- MERCHANT VIEW -->
-    <div id="merchantView" class="hidden" style="display: flex; flex-direction: column; gap: 14px;">
+    <div id="merchantView" class="hidden">
       <div class="scanner-box">
         <video id="webcamVideo" playsinline autoplay muted></video>
         <canvas id="qrCanvas" class="hidden"></canvas>
@@ -428,7 +435,11 @@
       localStorage.setItem(key, JSON.stringify(ledger));
     }
 
-    let knownNonces = new Set(getLocalLedger('merchant').map(r => String(r.n)));
+    let knownNonces = new Set(JSON.parse(localStorage.getItem('airupi_seen_nonces') || '[]'));
+
+    function persistNonces() {
+      localStorage.setItem('airupi_seen_nonces', JSON.stringify([...knownNonces]));
+    }
 
     // --- 5. Role Switcher ---
     function switchRole(role) {
@@ -466,7 +477,7 @@
         const color = isPayer ? "var(--danger)" : "var(--success)";
         const counterparty = isPayer ? (tx.payee || "merchant@airupi") : (tx.payer || "payer@airupi");
         const syncBadge = tx.synced 
-          ? `<span style="color: #38bdf8; font-size: 9px; padding: 2px 6px; background: rgba(56,189,248,0.1); border-radius: 4px;">SYNCED ✓</span>` 
+          ? `<span style="color: #38bdf8; font-size: 9px; padding: 2px 6px; background: rgba(56,189,248,0.1); border-radius: 4px;">RECEIVED ✓</span>` 
           : `<span style="color: #f59e0b; font-size: 9px; padding: 2px 6px; background: rgba(245,158,11,0.1); border-radius: 4px;">OFFLINE ⏳</span>`;
 
         return `
@@ -493,7 +504,7 @@
 
     function clearCurrentRoleLedger() {
       saveLocalLedger(activeRole, []);
-      if (activeRole === 'merchant') knownNonces.clear();
+      // NOTE: knownNonces is never cleared — replay protection persists
       renderLedger(activeRole);
     }
 
@@ -622,10 +633,35 @@
 
       try {
         const v = JSON.parse(text);
-        if (!v.amt || !v.n || !v.sig) return;
+
+        // Strict payload validation
+        if (!v.v || !v.payer || !v.payee || !v.pub || !v.sig) return;
+        if (typeof v.amt !== 'number' || v.amt <= 0 || !Number.isInteger(v.amt)) return;
+        if (typeof v.n !== 'number' || v.n <= 0 || !Number.isInteger(v.n)) return;
+        if (typeof v.t !== 'number' || v.t <= 0) return;
 
         const banner = document.getElementById('verdictBanner');
-        const nonceKey = String(v.n);
+
+        // Timestamp window check: reject vouchers older than 10 minutes or from the future (+60s tolerance)
+        const now = Math.floor(Date.now() / 1000);
+        if (v.t > now + 60 || v.t < now - 600) {
+          isScanningLocked = true;
+          banner.classList.remove('hidden');
+          banner.style.background = "var(--danger-bg)";
+          banner.style.border = "1px solid var(--danger)";
+          banner.style.color = "var(--danger)";
+          banner.innerHTML = `⚠ EXPIRED OR FUTURE VOUCHER (t=${v.t})`;
+          clearTimeout(cooldownTimer);
+          cooldownTimer = setTimeout(() => {
+            banner.classList.add('hidden');
+            isScanningLocked = false;
+          }, 2500);
+          return;
+        }
+
+        // Use pubkey prefix + nonce as replay key (handles multiple payer devices)
+        const pubPrefix = v.pub.substring(0, 12);
+        const nonceKey = `${pubPrefix}:${v.n}`;
 
         // Check for double-spend
         if (knownNonces.has(nonceKey)) {
@@ -648,8 +684,38 @@
         // Verify Ed25519 signature
         const canonical = `${v.payer}|${v.payee}|${v.amt}|${v.n}|${v.t}`;
         const msgBytes = new TextEncoder().encode(canonical);
-        const sigBytes = Uint8Array.from(atob(v.sig), c => c.charCodeAt(0));
-        const pubBytes = Uint8Array.from(atob(v.pub), c => c.charCodeAt(0));
+        let sigBytes, pubBytes;
+        try {
+          sigBytes = Uint8Array.from(atob(v.sig), c => c.charCodeAt(0));
+          pubBytes = Uint8Array.from(atob(v.pub), c => c.charCodeAt(0));
+        } catch (decodeErr) {
+          isScanningLocked = true;
+          banner.classList.remove('hidden');
+          banner.style.background = "var(--danger-bg)";
+          banner.style.border = "1px solid var(--danger)";
+          banner.style.color = "var(--danger)";
+          banner.innerHTML = "⚠ MALFORMED SIGNATURE OR KEY!";
+          setTimeout(() => {
+            banner.classList.add('hidden');
+            isScanningLocked = false;
+          }, 2000);
+          return;
+        }
+
+        if (pubBytes.length !== 32 || sigBytes.length !== 64) {
+          isScanningLocked = true;
+          banner.classList.remove('hidden');
+          banner.style.background = "var(--danger-bg)";
+          banner.style.border = "1px solid var(--danger)";
+          banner.style.color = "var(--danger)";
+          banner.innerHTML = "⚠ INVALID KEY OR SIGNATURE LENGTH!";
+          setTimeout(() => {
+            banner.classList.add('hidden');
+            isScanningLocked = false;
+          }, 2000);
+          return;
+        }
+
         const isValid = nacl.sign.detached.verify(msgBytes, sigBytes, pubBytes);
 
         if (!isValid) {
@@ -673,6 +739,8 @@
         if (navigator.vibrate) navigator.vibrate(200);
 
         knownNonces.add(nonceKey);
+        persistNonces();
+
         const mLedger = getLocalLedger('merchant');
         mLedger.unshift({ ...v, targetDeviceId: CURRENT_DEVICE_ID, synced: false });
         saveLocalLedger('merchant', mLedger);
@@ -744,16 +812,18 @@
 
         if (res.ok) {
           const data = await res.json();
-          const syncedNonces = new Set(data.synced || []);
-          const updated = ledger.map(tx => syncedNonces.has(tx.n) ? { ...tx, synced: true } : tx);
-          saveLocalLedger(role, updated);
-          renderLedger(role);
-          updateNetworkBadge(true);
+          if (data && data.status === "RECEIVED" && Array.isArray(data.synced)) {
+            const syncedNonces = new Set(data.synced);
+            const updated = ledger.map(tx => syncedNonces.has(tx.n) ? { ...tx, synced: true } : tx);
+            saveLocalLedger(role, updated);
+            renderLedger(role);
+            updateNetworkBadge(true);
 
-          const indicator = document.getElementById('syncIndicator');
-          if (indicator) {
-            indicator.style.background = "var(--success)";
-            setTimeout(() => { indicator.style.background = "#94a3b8"; }, 2000);
+            const indicator = document.getElementById('syncIndicator');
+            if (indicator) {
+              indicator.style.background = "var(--success)";
+              setTimeout(() => { indicator.style.background = "#94a3b8"; }, 2000);
+            }
           }
         }
       } catch (err) {
@@ -765,7 +835,7 @@
       const badge = document.getElementById('networkStatusBadge');
       if (!badge) return;
       if (isOnline) {
-        badge.innerText = "ONLINE: RECONCILED";
+        badge.innerText = "ONLINE: RECEIVED";
         badge.style.background = "rgba(16,185,129,0.15)";
         badge.style.color = "var(--success)";
         badge.style.border = "1px solid var(--success)";
@@ -793,6 +863,13 @@
 
     // Initial render
     renderLedger('payer');
+
+    // --- 10. Service Worker Registration ---
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js')
+        .then(reg => console.log('[AirUPI] SW registered, scope:', reg.scope))
+        .catch(err => console.warn('[AirUPI] SW registration failed:', err));
+    }
   </script>
 </body>
 </html>
